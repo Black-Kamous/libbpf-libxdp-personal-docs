@@ -54,6 +54,107 @@ static int (*bpf_map_delete_elem)(void *map, const void *key) = (void *) 3;
 - 用户端函数的功能是通过系统调用实现(在libbpf中观察的结果, 有待进一步研究), 内核端的调用实际上是调用了一个函数指针, 在内核源码中发现了读写函数的不同实现, 推测是一种(函数级别的)多态策略, 在编译或执行时确定实际调用的函数.
 - 得到结果的形式不同, 如lookup_elem
 
+**map-in-map**
+
+map有一种特殊的用法, 令一个map的value保存其他map的id, 这又可以称为map-in-map, 包括两种类型BPF_MAP_TYPE_ARRAY_OF_MAPS和BPF_MAP_TYPE_HASH_OF_MAPS, 相较于一般map有以下特点
+
+- 外层map只能在用户端程序中进行写入, BPF程序仅有读权限
+- 外层map的value是内层map的id, 而不是fd, 可以通过调用libbpf相关API进行转换, BPF程序不需转换
+
+> 注: 内核现仅支持一层嵌套, 不允许多层, 见[Kernel文档](https://docs.kernel.org/bpf/map_of_maps.html)
+
+给出几个片段展示其用法
+
+```C
+int create_outer_array(int inner_fd) {
+        LIBBPF_OPTS(bpf_map_create_opts, opts, .inner_map_fd = inner_fd);
+        int fd;
+
+        fd = bpf_map_create(BPF_MAP_TYPE_ARRAY_OF_MAPS,
+                            "example_array",       /* name */
+                            sizeof(__u32),         /* key size */
+                            sizeof(__u32),         /* value size */
+                            256,                   /* max entries */
+                            &opts);                /* create opts */
+        return fd;
+}
+```
+
+```C
+int add_devmap(int outer_fd, int index, const char *name) {
+        int fd;
+
+        fd = bpf_map_create(BPF_MAP_TYPE_DEVMAP, name,
+                            sizeof(__u32), sizeof(__u32), 256, NULL);
+        if (fd < 0)
+                return fd;
+
+        return bpf_map_update_elem(outer_fd, &index, &fd, BPF_ANY);
+}
+```
+
+```C
+struct inner_map {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, int);
+} inner_map1 SEC(".maps"),
+  inner_map2 SEC(".maps");
+
+struct outer_arr {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, 3);
+	__type(key, int);
+	__type(value, int);
+	/* it's possible to use anonymous struct as inner map definition here */
+	__array(values, struct {
+		__uint(type, BPF_MAP_TYPE_ARRAY);
+		/* changing max_entries to 2 will fail during load
+		 * due to incompatibility with inner_map definition */
+		__uint(max_entries, 1);
+		__type(key, int);
+		__type(value, int);
+	});
+} outer_arr SEC(".maps") = {
+	/* (void *) cast is necessary because we didn't use `struct inner_map`
+	 * in __inner(values, ...)
+	 * Actually, a conscious effort is required to screw up initialization
+	 * of inner map slots, which is a great thing!
+	 */
+	.values = { (void *)&inner_map1, 0, (void *)&inner_map2 },
+};
+
+...
+
+SEC("raw_tp/sys_enter")
+int handle__sys_enter(void *ctx)
+{
+	struct inner_map *inner_map;
+	int key = 0, val;
+
+	inner_map = bpf_map_lookup_elem(&outer_arr, &key);
+	if (!inner_map)
+		return 1;
+	val = input;
+	bpf_map_update_elem(inner_map, &key, &val, 0);
+
+	inner_map = bpf_map_lookup_elem(&outer_hash, &key);
+	if (!inner_map)
+		return 1;
+	val = input + 1;
+	bpf_map_update_elem(inner_map, &key, &val, 0);
+
+	inner_map = bpf_map_lookup_elem(&outer_arr_dyn, &key);
+	if (!inner_map)
+		return 1;
+	val = input + 2;
+	bpf_map_update_elem(inner_map, &key, &val, 0);
+
+	return 0;
+}
+```
+
 # libbpf
 
 ## compiling
@@ -99,10 +200,10 @@ bpf_object__for_each_program(prog, obj)
 一个宏, 扩展为一个for循环, 使用bpf_program__next()遍历一个obj中的所有bpf_program, prog为一个bpf_program指针, 上述函数利用这个宏处理obj中的每个program, 并取出第一个program返回.
 
 ```C
-bpf_object__find_program_by_title(const struct bpf_object *obj, const char *title)
+int bpf_object__find_program_by_name(const struct bpf_object *obj, const char *name)
 ```
 
-从obj中提取指定名称的program, 此处的title为section名字, 利用该函数可以提取一个文件中的特定program.
+从obj中提取指定名称的program, 此处的name为函数名, 利用该函数可以提取一个文件中的特定program.
 
 ```C
 int bpf_object__load(struct bpf_object *obj)
@@ -419,6 +520,10 @@ enum xdp_attach_mode {
 };
 ```
 
+### map使用相关
+
+需要特别注意，在第一步打开程序（open，create等等）过程后，bpf程序还未被加载入内核，此时去查找map fd的话会失败（返回-1），应在加载后再操作map。上面提到的 `xdp_program__attach_multi()` 函数中调用了 `xdp_multiprog__generate()` ，该函数又调用了 `xdp_multiprog__load()` ，该函数笼统地说是对 `bpf_object__load()` 在 `struct xdp_multiprog` 上的封装。因此，安装上面介绍的流程，必须在attach之后再进行map操作，也可以仿照 `xdp_program__attach_multi()` 的流程自行实现，并将map操作插入到load和attach之间，过于复杂此处不作考虑。
+
 ## 多重attaching实现原理
 
-
+//TODO
