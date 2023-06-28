@@ -526,4 +526,6 @@ enum xdp_attach_mode {
 
 ## 多重attaching实现原理
 
-//TODO
+内核EBPF和开发EBPF程序主要依赖的libbpf库都不支持同时在同一网卡上加载多个xdp程序，libxdp使用了一种调度器（Dispatcher）方法解决了这一问题。假设用户要将三个xdp程序加载到网卡（分别为prog1，prog2，prog3），网卡接收到的数据包应依次经过三个xdp程序的处理，每个程序的处理结果都有可能是PASS，DROP或REDIRECT等等。libxdp的解决方法是，使用一个专门的xdp程序，称为dispatcher，在得到freplace类型程序的支持后该程序能够调用其他xdp程序，并获取其处理结果，以进行进一步判断。libxdp只将该dispatcher挂载到网卡的驱动上，并将要调用的xdp程序加载到内核(即prog1，prog2，prog3)。用户可以指定每个xdp程序的优先级和chain call action，chain call action是从xdp处理结果（PASS，DROP等）到是/否继续调用下一个程序的映射，决定了dispatcher在接收到xdp程序处理结果后的行为，如果不继续调用则将处理结果和报文返回到内核。
+
+dispatcher接收到报文后，按照用户指定的优先级调用prog1，同时将报文传入；得到prog1的处理结果后，根据用户给出的chain call action判断是否调用下一个程序，以此类推。libxdp允许了动态地选择加载哪些xdp程序，也可以说是允许了xdp程序功能的动态变化。
